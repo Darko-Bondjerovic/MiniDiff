@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <ApplicationIcon>DiffForm.ico</ApplicationIcon>
+    <UseWindowsForms>true</UseWindowsForms>
+  </PropertyGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="DiffForm.ico">
+      <LogicalName>DiffForm.ico</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+</Project>
