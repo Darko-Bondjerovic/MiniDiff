@@ -1,3 +1,3 @@
-Compare text app 
+Two text compare application 
 
 dotnet run -c release
