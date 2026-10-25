@@ -60,6 +60,7 @@ public class DiffForm : Form
     int[] curBlockLine = new int[0];                          // linija (u prikazu) na kojoj svaki blok pocinje
     bool comparing = false;
     System.Windows.Forms.Timer autoCompareTimer;
+    const int LargeFileAutoCompareLimit = 6000;   // zbir linija oba fajla preko ovoga = samo rucno poredjenje (F5)
     string[] initialArgs;
 
     public DiffForm() : this(new string[0]) { }
@@ -275,6 +276,15 @@ public class DiffForm : Form
             var lines = StripFillers(disp);   // razmaci (FILL linije) nisu deo teksta
             if (rtb == rtbL) { masterLinesL = lines; RecordUndo(rtb, upL, disp, lines); }
             else if (rtb == rtbR) { masterLinesR = lines; RecordUndo(rtb, upR, disp, lines); }
+
+            // Kod velikih fajlova auto-poredjenje na SVAKI taster (i rebuild celog prikaza posle) zna da "zakoci"
+            // kucanje - za njih se ceka na rucno UPOREDI (F5), umesto automatskog poredjenja na svaku izmenu.
+            if (masterLinesL.Length + masterLinesR.Length > LargeFileAutoCompareLimit)
+            {
+                lblStatus.Text = "Veliki fajl - pritisni UPOREDI (F5) da ponovo uporediš";
+                autoCompareTimer.Stop();
+                return;
+            }
 
             lblStatus.Text = "Kucanje... auto-poredim";
             try { autoCompareTimer.Stop(); autoCompareTimer.Start(); } catch { DoCompare(); }
@@ -811,9 +821,68 @@ public class DiffForm : Form
     enum DiffType { Equal, Delete, Insert, Replace }
     class DiffBlock { public DiffType Type; public int StartL, CountL; public int StartR, CountR; }
 
-    List<DiffBlock> ComputeDiff(string[] a, string[] b)
+    // ---------- racunanje razlika - optimizovano za VELIKE fajlove ----------
+    // Problem koji je ovo resio: stari kod je radio O(n*m) DP tabelu na CELOM fajlu, a za fajlove
+    // preko 4000 linija je upadao u "ComputeDiffSimple" koji je pravio JEDAN blok PO LINIJI (bez
+    // poravnanja) - kod velikog fajla sa samo par izmenjenih linija to je znacilo hiljade "lažnih"
+    // Replace blokova (jer se sve linije posle izmene pomere za jednu), a onda se za SVAKI od tih
+    // blokova zasebno zove HighlightLines/GetFirstCharIndexFromLine - to je ono sto je "zaglavljivalo"
+    // ceo program (UI thread blokiran i nekoliko desetina sekundi na vecim fajlovima).
+    // Resenje: (1) najpre se odseca zajednicki prefiks/sufiks (linije koje su identicne na pocetku i
+    // na kraju oba fajla) - kod tipicne izmene (dodata/obrisana/izmenjena 1 linija u fajlu od 20000
+    // linija) ono sto ostaje "u sredini" za pravo poredjenje je ogromno manje; (2) poredjenje se radi
+    // nad brojevima (hash linije -> int), ne nad stringovima, sto je brze pri svakom poredjenju;
+    // (3) tacan O(n*m) DP se koristi SAMO na toj (obicno maloj) sredini; ako i sredina ostane
+    // prevelika (fajlovi koji su GENUINE potpuno razliciti), koristi se brzi fallback koji i dalje
+    // spaja susedne razlike u jedan blok (ne pravi hiljade sitnih blokova).
+    const int MaxDpCells = 4_000_000;   // ~2000x2000 - DP tabela preko ovoga postaje spora/zahtevna po memoriji
+
+    int[] HashLines(string[] lines, Dictionary<string, int> map)
     {
-        int n = a.Length, m = b.Length; if (n > 4000 || m > 4000) return ComputeDiffSimple(a, b);
+        var ids = new int[lines.Length];
+        for (int i = 0; i < lines.Length; i++)
+        {
+            string s = lines[i]; int id;
+            if (!map.TryGetValue(s, out id)) { id = map.Count; map[s] = id; }
+            ids[i] = id;
+        }
+        return ids;
+    }
+
+    List<DiffBlock> ComputeDiff(string[] aStr, string[] bStr)
+    {
+        // hash-uj linije u int-ove (brze poredjenje, posebno za duge linije/velike fajlove)
+        var map = new Dictionary<string, int>();
+        int[] a = HashLines(aStr, map);
+        int[] b = HashLines(bStr, map);
+
+        int n = a.Length, m = b.Length;
+        int prefix = 0, max0 = Math.Min(n, m);
+        while (prefix < max0 && a[prefix] == b[prefix]) prefix++;
+        int suffix = 0, maxSuf = max0 - prefix;
+        while (suffix < maxSuf && a[n - 1 - suffix] == b[m - 1 - suffix]) suffix++;
+
+        var blocks = new List<DiffBlock>();
+        if (prefix > 0) blocks.Add(new DiffBlock { Type = DiffType.Equal, StartL = 0, CountL = prefix, StartR = 0, CountR = prefix });
+
+        int n2 = n - prefix - suffix, m2 = m - prefix - suffix;
+        if (n2 > 0 || m2 > 0)
+        {
+            var a2 = new int[n2]; Array.Copy(a, prefix, a2, 0, n2);
+            var b2 = new int[m2]; Array.Copy(b, prefix, b2, 0, m2);
+            List<DiffBlock> middle = ((long)n2 * m2 > MaxDpCells) ? ComputeDiffSimple(a2, b2) : ComputeDiffDP(a2, b2);
+            foreach (var bl in middle)
+                blocks.Add(new DiffBlock { Type = bl.Type, StartL = bl.StartL + prefix, CountL = bl.CountL, StartR = bl.StartR + prefix, CountR = bl.CountR });
+        }
+
+        if (suffix > 0) blocks.Add(new DiffBlock { Type = DiffType.Equal, StartL = n - suffix, CountL = suffix, StartR = m - suffix, CountR = suffix });
+        return blocks;
+    }
+
+    // tacan LCS-baziran DP (kao i pre) - sada se zove samo na (obicno malom) delu posle odsecanja prefiksa/sufiksa
+    List<DiffBlock> ComputeDiffDP(int[] a, int[] b)
+    {
+        int n = a.Length, m = b.Length;
         int[,] dp = new int[n + 1, m + 1]; for (int i = n - 1; i >= 0; i--) for (int j = m - 1; j >= 0; j--) dp[i, j] = a[i] == b[j] ? dp[i + 1, j + 1] + 1 : Math.Max(dp[i + 1, j], dp[i, j + 1]);
         var blocks = new List<DiffBlock>(); int x = 0, y = 0;
         while (x < n && y < m) { if (a[x] == b[y]) { int sx = x, sy = y; while (x < n && y < m && a[x] == b[y]) { x++; y++; } blocks.Add(new DiffBlock { Type = DiffType.Equal, StartL = sx, CountL = x - sx, StartR = sy, CountR = y - sy }); } else { if (dp[x + 1, y] >= dp[x, y + 1]) { int sx = x; while (x < n && (y >= m || dp[x, y] == dp[x + 1, y])) x++; blocks.Add(new DiffBlock { Type = DiffType.Delete, StartL = sx, CountL = x - sx, StartR = y, CountR = 0 }); } else { int sy = y; while (y < m && (x >= n || dp[x, y] == dp[x, y + 1])) y++; blocks.Add(new DiffBlock { Type = DiffType.Insert, StartL = x, CountL = 0, StartR = sy, CountR = y - sy }); } } }
@@ -821,7 +890,40 @@ public class DiffForm : Form
         var merged = new List<DiffBlock>(); for (int i = 0; i < blocks.Count; i++) { if (i + 1 < blocks.Count && blocks[i].Type == DiffType.Delete && blocks[i + 1].Type == DiffType.Insert) { merged.Add(new DiffBlock { Type = DiffType.Replace, StartL = blocks[i].StartL, CountL = blocks[i].CountL, StartR = blocks[i + 1].StartR, CountR = blocks[i + 1].CountR }); i++; } else if (i + 1 < blocks.Count && blocks[i].Type == DiffType.Insert && blocks[i + 1].Type == DiffType.Delete) { merged.Add(new DiffBlock { Type = DiffType.Replace, StartL = blocks[i + 1].StartL, CountL = blocks[i + 1].CountL, StartR = blocks[i].StartR, CountR = blocks[i].CountR }); i++; } else merged.Add(blocks[i]); } return merged;
     }
 
-    List<DiffBlock> ComputeDiffSimple(string[] a, string[] b) { var blocks = new List<DiffBlock>(); int n = Math.Max(a.Length, b.Length); for (int i = 0; i < n; i++) { string la = i < a.Length ? a[i] : null; string lb = i < b.Length ? b[i] : null; if (la == null) blocks.Add(new DiffBlock { Type = DiffType.Insert, StartL = a.Length, CountL = 0, StartR = i, CountR = 1 }); else if (lb == null) blocks.Add(new DiffBlock { Type = DiffType.Delete, StartL = i, CountL = 1, StartR = b.Length, CountR = 0 }); else if (la == lb) blocks.Add(new DiffBlock { Type = DiffType.Equal, StartL = i, CountL = 1, StartR = i, CountR = 1 }); else blocks.Add(new DiffBlock { Type = DiffType.Replace, StartL = i, CountL = 1, StartR = i, CountR = 1 }); } return blocks; }
+    // Fallback za slucaj da i "sredina" (posle odsecanja prefiksa/sufiksa) ostane prevelika za tacan DP
+    // (fajlovi koji su GENUINE skoro potpuno razliciti). Za razliku od stare verzije, ovaj pravi JEDAN
+    // blok po NIZU susednih razlicitih/istih linija umesto jednog bloka po liniji - bitno manje blokova
+    // za iscrtavanje kod velikih fajlova.
+    List<DiffBlock> ComputeDiffSimple(int[] a, int[] b)
+    {
+        var blocks = new List<DiffBlock>();
+        int n = Math.Max(a.Length, b.Length), i = 0;
+        while (i < n)
+        {
+            bool aHas = i < a.Length, bHas = i < b.Length;
+            if (aHas && bHas && a[i] == b[i])
+            {
+                int s = i; while (i < a.Length && i < b.Length && a[i] == b[i]) i++;
+                blocks.Add(new DiffBlock { Type = DiffType.Equal, StartL = s, CountL = i - s, StartR = s, CountR = i - s });
+            }
+            else if (aHas && bHas)
+            {
+                int s = i; while (i < a.Length && i < b.Length && a[i] != b[i]) i++;
+                blocks.Add(new DiffBlock { Type = DiffType.Replace, StartL = s, CountL = i - s, StartR = s, CountR = i - s });
+            }
+            else if (aHas)
+            {
+                int s = i; while (i < a.Length && i >= b.Length) i++;
+                blocks.Add(new DiffBlock { Type = DiffType.Delete, StartL = s, CountL = i - s, StartR = b.Length, CountR = 0 });
+            }
+            else
+            {
+                int s = i; while (i < b.Length && i >= a.Length) i++;
+                blocks.Add(new DiffBlock { Type = DiffType.Insert, StartL = a.Length, CountL = 0, StartR = s, CountR = i - s });
+            }
+        }
+        return blocks;
+    }
 
     // ---------- prikaz sa razmacima (filler linije) ----------
     const string FILL = SyncRichTextBox.Filler;   // nevidljiva "linija" koja samo drzi mesto
